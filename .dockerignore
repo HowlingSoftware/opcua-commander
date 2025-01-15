@@ -1,2 +1,19 @@
+# basic
+**/.dockerignore
+**/.env
+**/.git
+**/.gitignore
+**/[Dd]ockerfile*
+
+# node
 node_modules
 npm-debug.log
+
+# dev
+.vscode/
+.history/
+.github/
+
+# proj
+docs/
+snap/
