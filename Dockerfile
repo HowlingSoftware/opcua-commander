@@ -1,9 +1,9 @@
 # to build
 #    docker build . -t commander
 # to run 
-#    docker run -it commander  -e opc.tcp://localhost:26543
+#    docker run -it commander -e opc.tcp://localhost:26543
 
-FROM node:20-alpine
+FROM node:22-alpine
 
 WORKDIR /opt/opcuacommander
 RUN npm config set registry http://registry.npmjs.org/
