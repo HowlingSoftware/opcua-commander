@@ -1,8 +1,7 @@
 import chalk from "chalk";
-import { assert } from "node-opcua-client"
-import { Widgets } from "blessed";
-import { TreeItem } from "./tree_item";
-const blessed = require("blessed");
+import { assert, NodeId, sameNodeId, NodeClass } from "node-opcua-client";
+import blessed, { Widgets } from "blessed";
+import { TreeItem } from "./tree_item.js";
 
 // some unicode icon characters ►▼◊◌○●□▪▫֎☺◘♦
 
@@ -10,7 +9,23 @@ function isFunction(variableToCheck: any) {
     return variableToCheck instanceof Function;
 }
 
-function toContent(node: any, isLastChild: boolean, parent: any): any {
+const nsColors = [
+    chalk.white,
+    chalk.cyan,
+    chalk.green,
+    chalk.yellow,
+    chalk.magenta,
+    chalk.blue,
+    chalk.red,
+    chalk.cyanBright,
+    chalk.greenBright,
+    chalk.yellowBright,
+    chalk.magentaBright,
+    chalk.blueBright,
+    chalk.redBright,
+];
+
+function toContent(node: any, isLastChild: boolean, parent: any, showNamespace: boolean): any {
 
     if (parent) {
         const sep = (parent.isLastChild) ? " " : "│";
@@ -27,7 +42,22 @@ function toContent(node: any, isLastChild: boolean, parent: any): any {
     const hasChildren = node.children && node.children.length > 0;
     //    [+]
     const c = node.expanded ? (hasChildren ? chalk.green("▼") : "─") : "►";
-    const str = node.prefix + s + c + node.name;
+    
+    let typeName = "";
+    if (node.typeDefinitionName) {
+        typeName = chalk.grey(" [" + node.typeDefinitionName + "]");
+    }
+
+    const ns = node.nodeId ? node.nodeId.namespace : 0;
+    const color = nsColors[ns % nsColors.length];
+    
+    let nameWithNs = node.name;
+    if (showNamespace && ns !== 0) {
+        nameWithNs = "(" + ns + ") " + node.name;
+    }
+    nameWithNs = color(nameWithNs);
+
+    const str = node.prefix + s + c + nameWithNs + typeName;
 
     return str;
 }
@@ -37,11 +67,13 @@ function dummy(node: any, callback: (err: Error | null, child: any) => void) {
 export interface Tree extends Widgets.ListElement {
 
 }
-export class Tree extends blessed.List {
+export class Tree extends (blessed as any).list {
+    public filterPattern: string = "";
     private items: TreeItem[] = [];
-    private __data: any;
+    public __data: any;
     private _index_selectedNode: number;
     private _old_selectedNode: any;
+    private showNamespace = false;
 
     constructor(options: any) {
 
@@ -74,6 +106,8 @@ export class Tree extends blessed.List {
 
         super(options);
 
+        this.showNamespace = !!options.showNamespace;
+
         this.key(["+", "right"], this.expandSelected.bind(this));
         this.key(["-", "left"], this.collapseSelected.bind(this));
 
@@ -83,7 +117,8 @@ export class Tree extends blessed.List {
 
     _add(node: any, isLastChild: boolean, parent: any) {
         node.isLastChild = isLastChild;
-        const item = this.add(toContent(node, isLastChild, parent)) as any;
+        node.parent = parent;
+        const item = this.add(toContent(node, isLastChild, parent, this.showNamespace)) as any;
         item.node = node;
         if (this._old_selectedNode === node) {
             this._index_selectedNode = this.itemCount - 1;
@@ -115,13 +150,15 @@ export class Tree extends blessed.List {
             node.children = node.children || [];
             let isLastChild;
 
-            for (let i = 0; i < node.children.length; i++) {
+            let childrenToWalk = node.children;
 
-                const child = node.children[i];
+            for (let i = 0; i < childrenToWalk.length; i++) {
+
+                const child = childrenToWalk[i];
                 if (child) {
                     child.depth = depth + 1;
 
-                    isLastChild = (i === node.children.length - 1);
+                    isLastChild = (i === childrenToWalk.length - 1);
                     this._add(child, isLastChild, node);
                     if (child.expanded && !isFunction(child.children)) {
                         dumpChildren.call(this, child, depth + 1);
@@ -159,11 +196,16 @@ export class Tree extends blessed.List {
 
     collapseSelected() {
         const node = this.getSelectedItem().node;
-        if (!node.expanded) {
-            return;
+        if (node.expanded) {
+            node.expanded = false;
+            this.setData(this.__data);
+        } else if (node.parent) {
+            const parentIndex = this.items.findIndex((item: any) => item.node === node.parent);
+            if (parentIndex >= 0) {
+                this.select(parentIndex);
+                this.screen.render();
+            }
         }
-        node.expanded = false;
-        this.setData(this.__data);
     }
 
     setData(data: any) {
@@ -177,8 +219,79 @@ export class Tree extends blessed.List {
     private getTreeItemAtPos(selectedIndex: number): TreeItem{
         return this.items[selectedIndex];
     }
-    private getSelectedIndex(): number {
+    public getSelectedIndex(): number {
         return (this as any).selected;
+    }
+    async expandPath(nodeIds: NodeId[]): Promise<void> {
+        let currentData = this.__data;
+        for (let i = 0; i < nodeIds.length; i++) {
+            const nodeId = nodeIds[i];
+            if (!sameNodeId(currentData.nodeId, nodeId)) {
+                // Find which child matches nodeId
+                const child = currentData.children?.find((c: any) => sameNodeId(c.nodeId, nodeId));
+                if (child) {
+                    currentData = child;
+                } else {
+                    // Try to expand currentData if it has children function
+                    if (isFunction(currentData.children)) {
+                         await new Promise<void>((resolve, reject) => {
+                             currentData.children.call(this, currentData, (err: Error | null, children: any) => {
+                                 if (err) return reject(err);
+                                 currentData.children = children;
+                                 currentData.expanded = true;
+                                 this.setData(this.__data);
+                                 resolve();
+                             });
+                         });
+                         const childAfter = currentData.children?.find((c: any) => sameNodeId(c.nodeId, nodeId));
+                         if (childAfter) {
+                             currentData = childAfter;
+                         } else {
+                             break;
+                         }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            
+            if (i === nodeIds.length - 1) {
+                // Found target!
+                this.setData(this.__data); // Ensure everything is walked
+                let index = (this as any).items.findIndex((item: any) => item && item.node === currentData);
+                if (index < 0) {
+                    index = (this as any).items.findIndex((item: any) => item && item.node && item.node.nodeId && sameNodeId(item.node.nodeId, nodeId));
+                }
+                if (index >= 0) {
+                    this.select(index);
+                    this.scrollTo(index);
+                    if (typeof this.emit === "function") {
+                        this.emit("select", this.items[index]);
+                    }
+                    if (this.screen) {
+                        this.screen.render();
+                    }
+                }
+                break;
+            }
+
+            if (!currentData.expanded) {
+                 if (isFunction(currentData.children)) {
+                      await new Promise<void>((resolve, reject) => {
+                          currentData.children.call(this, currentData, (err: Error | null, children: any) => {
+                              if (err) return reject(err);
+                              currentData.children = children;
+                              currentData.expanded = true;
+                              this.setData(this.__data);
+                              resolve();
+                          });
+                      });
+                 } else {
+                      currentData.expanded = true;
+                      this.setData(this.__data);
+                 }
+            }
+        }
     }
 }
 

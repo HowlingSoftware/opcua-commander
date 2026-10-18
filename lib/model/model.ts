@@ -1,13 +1,16 @@
 import { EventEmitter } from "events";
 import os from "os";
-import {
+import fs from "fs";
+import { exploreCertificate, certificateMatchesPrivateKey, readPrivateKey, readCertificate } from "node-opcua-crypto";
+
+import chalk from "chalk";
+const {
   bgBlueBright,
   yellow,
   cyanBright,
   greenBright, 
   magenta, bgCyanBright, cyan, bgGreenBright, bgWhiteBright, yellowBright, green, magentaBright, red
-}
-  from "chalk";
+} = chalk;
 import {
   accessLevelFlagToString,
   AttributeIds,
@@ -20,6 +23,7 @@ import {
   DataType,
   DataTypeIds,
   DataValue,
+  ExpandedNodeId,
   installAlarmMonitoring,
   MessageSecurityMode,
   MonitoringMode,
@@ -29,6 +33,7 @@ import {
   ReadValueIdOptions,
   ReferenceDescription,
   resolveNodeId,
+  sameNodeId,
   SecurityPolicy,
   TimestampsToReturn,
   UserIdentityInfo,
@@ -40,10 +45,11 @@ import {
 import { OPCUACertificateManager } from "node-opcua-certificate-manager";
 import { StatusCodes } from "node-opcua-status-code";
 import { findBasicDataType } from "node-opcua-pseudo-session";
+import { getStandardDataTypeFactory } from "node-opcua-factory";
 
-import { w } from "../utils/utils";
-import { extractBrowsePath } from "../utils/extract_browse_path";
-import { TreeItem } from "../widget/tree_item";
+import { w } from "../utils/utils.js";
+import { extractBrowsePath } from "../utils/extract_browse_path.js";
+import { TreeItem } from "../widget/tree_item.js";
 
 const attributeKeys: string[] = [];
 for (let i = 1; i <= AttributeIds.AccessLevelEx - 1; i++) {
@@ -66,6 +72,8 @@ export interface NodeChild {
   displayName: string;
   nodeId: NodeId;
   nodeClass: NodeClass;
+  typeDefinition?: ExpandedNodeId;
+  typeDefinitionName?: string;
 }
 
 export function makeUserIdentity(argv: any): UserIdentityInfo {
@@ -78,10 +86,32 @@ export function makeUserIdentity(argv: any): UserIdentityInfo {
       password: argv.password,
     };
   } else if (argv.userCertificate && argv.userCertificatePrivateKey) {
+    if (!fs.existsSync(argv.userCertificate)) {
+      throw new Error("Cannot find user certificate file: " + argv.userCertificate);
+    }
+    if (!fs.existsSync(argv.userCertificatePrivateKey)) {
+      throw new Error("Cannot find user certificate private key file: " + argv.userCertificatePrivateKey);
+    }
+    const certificateData = readCertificate(argv.userCertificate);
+    const privateKeyPEM = fs.readFileSync(argv.userCertificatePrivateKey, "utf-8");
+    const privateKey = readPrivateKey(argv.userCertificatePrivateKey);
+
+    // verify certificate and private key
+    if (!certificateMatchesPrivateKey(certificateData, privateKey)) {
+      throw new Error("User certificate and private key do not match!");
+    }
+
+    const certInfo = exploreCertificate(certificateData);
+    const formatX500Name = (name: any) => Object.entries(name).map(([k, v]) => `${k}=${v}`).join(", ");
+    console.log(cyan("Using User Certificate:"));
+    console.log(cyan("  subject:  "), green(formatX500Name(certInfo.tbsCertificate.subject)));
+    console.log(cyan("  issuer:   "), green(formatX500Name(certInfo.tbsCertificate.issuer)));
+    console.log(cyan("  validity: "), green(certInfo.tbsCertificate.validity.notBefore.toISOString() + " - " + certInfo.tbsCertificate.validity.notAfter.toISOString()));
+
     userIdentity = {
       type: UserTokenType.Certificate,
-      certificateData: argv.userCertificate,
-      privateKey: "todo",
+      certificateData,
+      privateKey: privateKeyPEM,
     };
   }
   return userIdentity;
@@ -149,11 +179,24 @@ export class Model extends EventEmitter {
   private endpointUrl: string = "";
   private monitoredItemsListData: any[] = [];
   private clientAlarms: ClientAlarmList = new ClientAlarmList();
+  private enumDefinitionCache: Map<string, Map<number, string> | null> = new Map();
+  private typeNameCache: Map<string, string> = new Map();
+  private multiStateCache: Map<string, string[]> = new Map();
+  private euPropertiesCache: Map<string, { euRange?: string; engineeringUnits?: string }> = new Map();
 
   public data: any;
+  public showNamespace = false;
+  public subtypeMode = false;
   public constructor() {
     super();
     this.data = data;
+  }
+
+  public clearCache() {
+    this.enumDefinitionCache.clear();
+    this.typeNameCache.clear();
+    this.multiStateCache.clear();
+    this.euPropertiesCache.clear();
   }
 
   public async initialize(
@@ -186,42 +229,43 @@ export class Model extends EventEmitter {
       keepSessionAlive: true,
     });
 
-    this.client.on("send_request", function () {
+    (this.client as any).on("send_request", function () {
       data.transactionCount++;
     });
 
-    this.client.on("send_chunk", function (chunk) {
+    (this.client as any).on("send_chunk", function (chunk: any) {
       data.sentBytes += chunk.length;
       data.sentChunks++;
     });
 
-    this.client.on("receive_chunk", function (chunk) {
+    (this.client as any).on("receive_chunk", function (chunk: any) {
       data.receivedBytes += chunk.length;
       data.receivedChunks++;
     });
 
-    this.client.on("backoff", function (number, delay) {
+    (this.client as any).on("backoff", function (number: any, delay: any) {
       data.backoffCount += 1;
       console.log(yellow(`backoff  attempt #${number} retrying in ${delay / 1000.0} seconds`));
     });
 
-    this.client.on("start_reconnection", () => {
+    (this.client as any).on("start_reconnection", () => {
       console.log(red(" !!!!!!!!!!!!!!!!!!!!!!!!  Starting reconnection !!!!!!!!!!!!!!!!!!! " + this.endpointUrl));
+      this.clearCache();
     });
 
-    this.client.on("connection_reestablished", () => {
+    (this.client as any).on("connection_reestablished", () => {
       console.log(red(" !!!!!!!!!!!!!!!!!!!!!!!!  CONNECTION RE-ESTABLISHED !!!!!!!!!!!!!!!!!!! " + this.endpointUrl));
       data.reconnectionCount++;
     });
 
     // monitoring des lifetimes
-    this.client.on("lifetime_75", (token) => {
+    (this.client as any).on("lifetime_75", (token: any) => {
       if (this.verbose) {
         console.log(red("received lifetime_75 on " + this.endpointUrl));
       }
     });
 
-    this.client.on("security_token_renewed", () => {
+    (this.client as any).on("security_token_renewed", () => {
       data.tokenRenewalCount += 1;
       if (this.verbose) {
         console.log(green(" security_token_renewed on " + this.endpointUrl));
@@ -253,14 +297,14 @@ export class Model extends EventEmitter {
     console.log("connecting to ....", endpointUrl);
     try {
       await this.client!.connect(endpointUrl);
-    } catch (err) {
+    } catch (err: any) {
       console.log(" Cannot connect", err.toString());
       if (this.client!.securityMode !== MessageSecurityMode.None && err.message.match(/has been disconnected by third party/)) {
         console.log(
           "Because you are using a secure connection, you need to make sure that the certificate\n" +
           "of opcua-commander is trusted by the server you're trying to connect to.\n" +
           "Please see the documentation for instructions on how to import a certificate into the CA store of the server.\n" +
-          `The opcua-commander certificate is in the folder \n${cyan(this.client!.certificateFile)}`
+          `The opcua-commander certificate is in the folder \n${cyan(this.client!.certificateFile!)}`
         );
       }
       this.emit("connectionError", err);
@@ -269,7 +313,7 @@ export class Model extends EventEmitter {
 
     try {
       this.session = await this.client!.createSession(this.userIdentity);
-    } catch (err) {
+    } catch (err: any) {
       console.log(" Cannot create session ", err.toString());
       console.log(red("  exiting"));
       setTimeout(function () {
@@ -279,6 +323,7 @@ export class Model extends EventEmitter {
     }
     this.session.on("session_closed", () => {
       console.log(" Warning => Session closed");
+      this.clearCache();
     });
     this.session.on("keepalive", () => {
       console.log("session keepalive");
@@ -306,15 +351,17 @@ export class Model extends EventEmitter {
   }
 
   public async writeNode(node: { nodeId: NodeId }, data: any) {
+    if (!this.session) return StatusCodes.BadSessionIdInvalid;
     const dataTypeIdDataValue = await this.session.read({ nodeId: node.nodeId, attributeId: AttributeIds.DataType });
     const arrayDimensionDataValue = await this.session.read({ nodeId: node.nodeId, attributeId: AttributeIds.ArrayDimensions });
     const valueRankDataValue = await this.session.read({ nodeId: node.nodeId, attributeId: AttributeIds.ValueRank });
 
-    const dataTypeId = dataTypeIdDataValue.value.value as NodeId;
-    const dataType = await findBasicDataType(this.session, dataTypeId);
+    const dataTypeId = dataTypeIdDataValue.value?.value as NodeId;
+    if (!dataTypeId) return StatusCodes.BadDataTypeIdUnknown;
+    const dataType = await findBasicDataType(this.session as any, dataTypeId);
 
-    const arrayDimension = arrayDimensionDataValue.value.value as null | number[];
-    const valueRank = valueRankDataValue.value.value as number;
+    const arrayDimension = arrayDimensionDataValue.value?.value as null | number[];
+    const valueRank = valueRankDataValue.value?.value as number;
 
     const coerceBoolean = (data: any) => {
       return data === "true" || data === "1" || data === true;
@@ -389,10 +436,10 @@ export class Model extends EventEmitter {
   }
 
   public async extractBrowsePath(nodeId: NodeId): Promise<string> {
-    return await extractBrowsePath(this.session, nodeId);
+    return await extractBrowsePath(this.session!, nodeId);
   }
   public async readNode(node: any) {
-    return await this.session.read(node);
+    return await this.session!.read(node);
   }
   public async readNodeValue(node: any) {
     if (!this.session) {
@@ -401,12 +448,12 @@ export class Model extends EventEmitter {
 
     const dataValues = await this.readNode(node);
     if (dataValues.statusCode == StatusCodes.Good) {
-      if (dataValues.value.value) {
+      if (dataValues.value?.value) {
         switch (dataValues.value.arrayType) {
           case VariantArrayType.Scalar:
             return "" + dataValues.value.value;
           case VariantArrayType.Array:
-            return dataValues.value.value.join(",");
+            return (dataValues.value.value as any[]).join(",");
           default:
             return "";
         }
@@ -415,9 +462,24 @@ export class Model extends EventEmitter {
     return null;
   }
 
-  public monitor_item(treeItem: TreeItem) {
-    if (!this.subscription) return;
+  public async monitor_item(treeItem: TreeItem) {
+    if (!this.subscription || !this.session) return;
     const node = treeItem.node;
+
+    // Fetch DataType if not already present on the node
+    if (!node.dataTypeNodeId) {
+      try {
+        const dataValue = await this.session.read({
+          nodeId: node.nodeId,
+          attributeId: AttributeIds.DataType
+        });
+        if (dataValue.statusCode === StatusCodes.Good) {
+          node.dataTypeNodeId = dataValue.value.value;
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
 
     this.subscription.monitor(
       {
@@ -432,9 +494,9 @@ export class Model extends EventEmitter {
       },
       TimestampsToReturn.Both,
       MonitoringMode.Reporting,
-      (err: Error | null, monitoredItem: ClientMonitoredItem) => {
-        if (err) {
-          console.log("cannot create monitored item", err.message);
+      (err: Error | null, monitoredItem?: ClientMonitoredItem) => {
+        if (err || !monitoredItem) {
+          console.log("cannot create monitored item", err ? err.message : "unknown error");
           return;
         }
 
@@ -447,12 +509,20 @@ export class Model extends EventEmitter {
         this.emit("monitoredItemListUpdated", this.monitoredItemsListData);
         //   xxx                monitoredItemsList.setRows(monitoredItemsListData);
 
-        monitoredItem.on("changed", (dataValue: DataValue) => {
+        monitoredItem.on("changed", async (dataValue: DataValue) => {
           console.log(" value ", node.browseName, node.nodeId.toString(), " changed to ", green(dataValue.value.toString()));
-          if (dataValue.value.value.toFixed) {
+          
+          let enumStr: string | null = null;
+          if (node.dataTypeNodeId && dataValue.value && typeof dataValue.value.value === "number") {
+             enumStr = await this.getEnumerationMaybe(node.dataTypeNodeId, dataValue.value.value);
+          }
+
+          if (enumStr) {
+             node.valueAsString = w(enumStr, 16, " ");
+          } else if (dataValue.value && dataValue.value.value !== null && dataValue.value.value.toFixed && typeof dataValue.value.value === "number") {
             node.valueAsString = w(dataValue.value.value.toFixed(3), 16, " ");
           } else {
-            node.valueAsString = w(dataValue.value.value.toString(), 16, " ");
+            node.valueAsString = w(dataValue.value ? dataValue.value.value.toString() : "null", 16, " ");
           }
           monitoredItemData[2] = node.valueAsString;
 
@@ -493,13 +563,348 @@ export class Model extends EventEmitter {
     });
   }
 
-  public async readNodeAttributes(nodeId: NodeId): Promise<{ attribute: string, text: string }[]> {
+  /**
+   * Attempts to resolve a numeric value to its enumeration string.
+   * Checks if the DataType NodeId is a subtype of Enumeration by:
+   * 1. Fast path: looking up standard enumerations in the factory
+   * 2. Server path: browsing the DataType node for EnumStrings or EnumValues properties
+   */
+  public async getEnumerationMaybe(
+    dataTypeNodeId: NodeId,
+    value: number
+  ): Promise<string | null> {
+    const key = dataTypeNodeId.toString();
+
+    // 1. Check Cache first
+    if (this.enumDefinitionCache.has(key)) {
+      const map = this.enumDefinitionCache.get(key);
+      if (map) {
+        return map.get(value) ?? null;
+      }
+      // if map is null, it means we already tried and it's not an enum or failed
+      return null;
+    }
+
+    // 2. Fast path: check standard factory for known enumerations (ns=0)
+    if (dataTypeNodeId.namespace === 0) {
+      const enumName = DataTypeIdsToString[dataTypeNodeId.value.toString()];
+      if (enumName) {
+        const factory = getStandardDataTypeFactory();
+        if (factory.hasEnumeration(enumName)) {
+          const enumeration = factory.getEnumeration(enumName);
+          if (enumeration) {
+            const item = enumeration.typedEnum.get(value);
+            if (item) return item.key;
+          }
+        }
+      }
+    }
+
+    // 3. Server path: browse the DataType node for EnumStrings or EnumValues
+    if (!this.session) return null;
+
+    try {
+      const browseResult = await this.session.browse({
+        nodeId: dataTypeNodeId,
+        referenceTypeId: "HasProperty",
+        includeSubtypes: true,
+        browseDirection: BrowseDirection.Forward,
+        resultMask: 0x3f,
+      });
+
+      if (!browseResult.references || browseResult.references.length === 0) {
+        this.enumDefinitionCache.set(key, null);
+        return null;
+      }
+
+      let enumMap: Map<number, string> | null = null;
+
+      for (const ref of browseResult.references) {
+        const name = ref.browseName.name;
+
+        if (name === "EnumStrings") {
+          // EnumStrings: array of LocalizedText indexed by enum value
+          const dv = await this.session!.read({
+            nodeId: ref.nodeId,
+            attributeId: AttributeIds.Value,
+          });
+          if (dv.value?.value && Array.isArray(dv.value.value)) {
+            enumMap = new Map();
+            const strings = dv.value.value;
+            for (let i = 0; i < strings.length; i++) {
+              const lt = strings[i];
+              enumMap.set(i, lt.text ?? lt.toString());
+            }
+            break;
+          }
+        }
+
+        if (name === "EnumValues") {
+          // EnumValues: array of EnumValueType { value: Int64, displayName: LocalizedText }
+          const dv = await this.session!.read({
+            nodeId: ref.nodeId,
+            attributeId: AttributeIds.Value,
+          });
+          if (dv.value?.value && Array.isArray(dv.value.value)) {
+            enumMap = new Map();
+            for (const ev of dv.value.value) {
+              const evValue = Array.isArray(ev.value) ? ev.value[1] : ev.value;
+              enumMap.set(Number(evValue), ev.displayName?.text ?? ev.displayName?.toString());
+            }
+            break;
+          }
+        }
+      }
+
+      this.enumDefinitionCache.set(key, enumMap);
+      if (enumMap) {
+        return enumMap.get(value) ?? null;
+      }
+
+    } catch (err) {
+      // ignore
+    }
+
+    return null;
+  }
+
+
+  public async browseReferences(nodeId: NodeId): Promise<ReferenceDescription[]> {
+    if (!this.session) return [];
+    try {
+      const results = await this.session!.browse({
+        nodeId,
+        browseDirection: BrowseDirection.Both,
+        includeSubtypes: true,
+        resultMask: 63,
+      });
+      return results.references || [];
+    } catch (err) {
+      console.log(err);
+      return [];
+    }
+  }
+
+  public async findPathToRoot(nodeId: NodeId): Promise<NodeId[]> {
+    if (!this.session) return [];
+    const path = [nodeId];
+    let current = nodeId;
+    const rootFolderId = resolveNodeId("RootFolder");
+    try {
+      while (!sameNodeId(current, rootFolderId)) {
+        const results = await this.session!.browse({
+          nodeId: current,
+          referenceTypeId: "HierarchicalReferences",
+          browseDirection: BrowseDirection.Inverse,
+          includeSubtypes: true,
+          resultMask: 63,
+        });
+        if (!results.references || results.references.length === 0) break;
+        // Pick the first hierarchical parent
+        current = NodeId.resolveNodeId(results.references[0].nodeId);
+        path.unshift(current);
+        if (path.length > 20) break; // Safety break
+      }
+    } catch (err) {
+      console.log(err);
+    }
+    return path;
+  }
+
+  public async nodeExists(nodeId: NodeId): Promise<boolean> {
+    if (!this.session) return false;
+    try {
+      const dv = await this.session.read({
+        nodeId,
+        attributeId: AttributeIds.NodeClass,
+      });
+      return dv.statusCode === StatusCodes.Good;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  public async parseNodeId(nodeIdStr: string): Promise<NodeId> {
+    if (!this.session) {
+      throw new Error("No active session");
+    }
+
+    nodeIdStr = nodeIdStr.trim();
+
+    // 1. Handle nsi= by rewriting to ns=
+    if (nodeIdStr.startsWith("nsi=")) {
+      nodeIdStr = "ns=" + nodeIdStr.substring(4);
+    }
+
+    // 2. Handle nsu= format
+    if (nodeIdStr.startsWith("nsu=")) {
+      const semiColonIndex = nodeIdStr.indexOf(";");
+      if (semiColonIndex === -1) {
+        throw new Error("Invalid NodeId format. Missing ';' after namespace URI.");
+      }
+      const uri = nodeIdStr.substring(4, semiColonIndex);
+      const identifierPart = nodeIdStr.substring(semiColonIndex + 1);
+
+      // Read NamespaceArray
+      const dataValue = await this.session.read({
+        nodeId: "ns=0;i=2255",
+        attributeId: AttributeIds.Value,
+      });
+
+      if (!dataValue || !dataValue.value || !Array.isArray(dataValue.value.value)) {
+        throw new Error("Failed to read server NamespaceArray.");
+      }
+
+      const namespaceArray: string[] = dataValue.value.value;
+      const index = namespaceArray.indexOf(uri);
+      if (index === -1) {
+        throw new Error(`Namespace URI '${uri}' not found on the server.`);
+      }
+
+      nodeIdStr = `ns=${index};${identifierPart}`;
+    }
+
+    try {
+      return resolveNodeId(nodeIdStr);
+    } catch (err: any) {
+      throw new Error(`Invalid NodeId format: ${err.message}`);
+    }
+  }
+
+
+  public async getBrowseNameMaybe(nodeId: NodeId): Promise<string> {
+    const key = nodeId.toString();
+    if (this.typeNameCache.has(key)) {
+      return this.typeNameCache.get(key)!;
+    }
+    if (!this.session) return key;
+    try {
+      const dv = await this.session.read({
+        nodeId,
+        attributeId: AttributeIds.BrowseName,
+      });
+      if (dv.statusCode === StatusCodes.Good) {
+        const name = dv.value.value.name || dv.value.value.toString();
+        this.typeNameCache.set(key, name);
+        return name;
+      }
+    } catch (err) {
+      // ignore
+    }
+    return key;
+  }
+
+  private async getMultiStateStringMaybe(nodeId: NodeId, value: number): Promise<string | null> {
+    const cacheKey = nodeId.toString();
+    if (this.multiStateCache.has(cacheKey)) {
+      const strings = this.multiStateCache.get(cacheKey)!;
+      return strings[value] || null;
+    }
+
+    try {
+      // Browse for EnumStrings property
+      const browseResult = await this.session!.browse({
+        nodeId,
+        referenceTypeId: "HasProperty",
+        browseDirection: BrowseDirection.Forward,
+        resultMask: 63,
+      });
+
+      const enumStringsRef = browseResult.references?.find((r) => r.browseName.name === "EnumStrings");
+      if (enumStringsRef) {
+        const enumStringsValue = await this.session!.read({
+          nodeId: enumStringsRef.nodeId,
+          attributeId: AttributeIds.Value,
+        });
+
+        if (enumStringsValue.statusCode === StatusCodes.Good && Array.isArray(enumStringsValue.value.value)) {
+          const enumStrings = enumStringsValue.value.value.map((v: any) => v.text || v.toString());
+          this.multiStateCache.set(cacheKey, enumStrings);
+          return enumStrings[value] || null;
+        }
+      }
+    } catch (err) {
+      // ignore
+    }
+    return null;
+  }
+
+  private async getEURangeAndEngineeringUnitsMaybe(nodeId: NodeId): Promise<{ euRange?: string; engineeringUnits?: string }> {
+    const key = nodeId.toString();
+    if (this.euPropertiesCache.has(key)) {
+      return this.euPropertiesCache.get(key)!;
+    }
+
+    const result: { euRange?: string; engineeringUnits?: string } = {};
+
+    if (!this.session) {
+      return result;
+    }
+
+    try {
+      const browseResult = await this.session.browse({
+        nodeId,
+        referenceTypeId: "HasProperty",
+        browseDirection: BrowseDirection.Forward,
+        includeSubtypes: true,
+        resultMask: 63,
+      });
+
+      if (browseResult.references && browseResult.references.length > 0) {
+        for (const ref of browseResult.references) {
+          const name = ref.browseName.name;
+          if (name === "EURange") {
+            try {
+              const dv = await this.session.read({
+                nodeId: ref.nodeId,
+                attributeId: AttributeIds.Value,
+              });
+              if (dv.statusCode === StatusCodes.Good && dv.value?.value) {
+                const val = dv.value.value;
+                if (typeof val === "object" && val !== null && "low" in val && "high" in val) {
+                  result.euRange = `[ ${val.low}, ${val.high} ]`;
+                }
+              }
+            } catch (e) {
+              // ignore
+            }
+          } else if (name === "EngineeringUnits") {
+            try {
+              const dv = await this.session.read({
+                nodeId: ref.nodeId,
+                attributeId: AttributeIds.Value,
+              });
+              if (dv.statusCode === StatusCodes.Good && dv.value?.value) {
+                const val = dv.value.value;
+                if (typeof val === "object" && val !== null) {
+                  if (val.displayName && typeof val.displayName === "object") {
+                    result.engineeringUnits = val.displayName.text || val.displayName.toString();
+                  } else if (val.displayName) {
+                    result.engineeringUnits = val.displayName.toString();
+                  }
+                }
+              }
+            } catch (e) {
+              // ignore
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // ignore
+    }
+
+    this.euPropertiesCache.set(key, result);
+    return result;
+  }
+
+  public async readNodeAttributes(nodeId: NodeId): Promise<{ attribute: string; text: string }[]> {
     if (!this.session) {
       return [];
     }
-    const nodesToRead: ReadValueIdOptions[] = attributeKeys.map((attributeId: string) => ({
+    const nodesToRead: ReadValueIdOptions[] = attributeKeys.map((attributeIdName: string) => ({
       nodeId,
-      attributeId: ((AttributeIds as any)[attributeId as any]) as AttributeIds,
+      attributeId: ((AttributeIds as any)[attributeIdName as any]) as AttributeIds,
     }));
 
     try {
@@ -507,18 +912,95 @@ export class Model extends EventEmitter {
       const dataValues = await this.session!.read(nodesToRead);
       const results: { attribute: string, text: string }[] = [];
 
+      let dataTypeNodeId: NodeId | null = null;
+      const dataTypeIdx = nodesToRead.findIndex(n => n.attributeId === AttributeIds.DataType);
+      if (dataTypeIdx >= 0 && dataValues[dataTypeIdx].statusCode === StatusCodes.Good) {
+        dataTypeNodeId = dataValues[dataTypeIdx].value.value;
+      }
+
+      let nodeClass: NodeClass | null = null;
+      const nodeClassIdx = nodesToRead.findIndex(n => n.attributeId === AttributeIds.NodeClass);
+      if (nodeClassIdx >= 0 && dataValues[nodeClassIdx].statusCode === StatusCodes.Good) {
+        nodeClass = dataValues[nodeClassIdx].value.value as NodeClass;
+      }
+
+      // Pre-resolve enumeration string for the Value attribute
+      let resolvedEnumString: string | null = null;
+      if (dataTypeNodeId) {
+        const valueAttrIdx = nodesToRead.findIndex(n => n.attributeId === AttributeIds.Value);
+        if (valueAttrIdx >= 0 && dataValues[valueAttrIdx].statusCode === StatusCodes.Good) {
+          const v = dataValues[valueAttrIdx].value?.value;
+          if (typeof v === "number") {
+            resolvedEnumString = await this.getEnumerationMaybe(dataTypeNodeId, v);
+            if (!resolvedEnumString) {
+              resolvedEnumString = await this.getMultiStateStringMaybe(nodeId, v);
+            }
+          }
+        }
+      }
+
       for (let i = 0; i < nodesToRead.length; i++) {
         const nodeToRead = nodesToRead[i];
         const dataValue = dataValues[i];
 
-        if (dataValue.statusCode !== StatusCodes.Good) {
+        if (dataValue.statusCode !== StatusCodes.Good && nodeToRead.attributeId !== AttributeIds.Value) {
           continue;
         }
-        const s = toString1(nodeToRead.attributeId, dataValue);
-        results.push({
-          attribute: attributeIdToString[nodeToRead.attributeId],
-          text: s,
-        });
+
+        if (nodeToRead.attributeId === AttributeIds.Value) {
+          if (nodeClass === NodeClass.Variable || nodeClass === NodeClass.VariableType) {
+            let valueText = dataValueValueToString(dataValue, resolvedEnumString);
+            let euRange: string | undefined;
+            let engineeringUnits: string | undefined;
+            try {
+              const props = await this.getEURangeAndEngineeringUnitsMaybe(nodeId);
+              euRange = props.euRange;
+              engineeringUnits = props.engineeringUnits;
+            } catch (err) {
+              // ignore
+            }
+
+            if (engineeringUnits) {
+              valueText += " " + engineeringUnits;
+            }
+
+            // Push separate entries for a better UX
+            results.push({
+              attribute: "Value",
+              text: valueText
+            });
+            if (euRange) {
+              results.push({
+                attribute: "EURange",
+                text: euRange
+              });
+            }
+            results.push({
+              attribute: "StatusCode",
+              text: dataValue.statusCode ? dataValue.statusCode.toString() : "Good"
+            });
+            if (dataValue.sourceTimestamp && dataValue.sourceTimestamp.getTime() !== 0) {
+              let src = dataValue.sourceTimestamp.toISOString();
+              if (dataValue.sourcePicoseconds !== undefined && dataValue.sourcePicoseconds !== 0) {
+                src += " ns:" + dataValue.sourcePicoseconds;
+              }
+              results.push({ attribute: "SourceTimestamp", text: src });
+            }
+            if (dataValue.serverTimestamp && dataValue.serverTimestamp.getTime() !== 0) {
+              let srv = dataValue.serverTimestamp.toISOString();
+              if (dataValue.serverPicoseconds !== undefined && dataValue.serverPicoseconds !== 0) {
+                srv += " ns:" + dataValue.serverPicoseconds;
+              }
+              results.push({ attribute: "ServerTimestamp", text: srv });
+            }
+          }
+        } else {
+          const s = toString1(nodeToRead.attributeId!, dataValue, dataTypeNodeId, null);
+          results.push({
+            attribute: attributeIdToString[nodeToRead.attributeId!],
+            text: s,
+          });
+        }
       }
       return results;
     } catch (err) {
@@ -527,7 +1009,7 @@ export class Model extends EventEmitter {
     }
   }
 
-  public async expand_opcua_node(node: any): Promise<NodeChild[]> {
+public async expand_opcua_node(node: any): Promise<NodeChild[]> {
     if (!this.session) {
       throw new Error("No Session yet");
     }
@@ -537,72 +1019,103 @@ export class Model extends EventEmitter {
 
     const children: NodeChild[] = [];
 
-    const nodesToBrowse = [
-      {
-        nodeId: node.nodeId,
-        referenceTypeId: "Organizes",
-        includeSubtypes: true,
-        browseDirection: BrowseDirection.Forward,
-        resultMask: 0x3f,
-      },
-      {
-        nodeId: node.nodeId,
-        referenceTypeId: "Aggregates",
-        includeSubtypes: true,
-        browseDirection: BrowseDirection.Forward,
-        resultMask: 0x3f,
-      },
-      {
-        nodeId: node.nodeId,
-        referenceTypeId: "HasSubtype",
-        includeSubtypes: true,
-        browseDirection: BrowseDirection.Forward,
-        resultMask: 0x3f,
-      },
-    ];
+    let nodesToBrowse;
+    const isTypeNode = node && (
+      node.nodeClass === NodeClass.ObjectType ||
+      node.nodeClass === NodeClass.VariableType ||
+      node.nodeClass === NodeClass.DataType ||
+      node.nodeClass === NodeClass.ReferenceType
+    );
+    if (this.subtypeMode && isTypeNode) {
+        nodesToBrowse = [
+            {
+                nodeId: node.nodeId,
+                referenceTypeId: "HasSubtype",
+                includeSubtypes: true,
+                browseDirection: BrowseDirection.Forward,
+                resultMask: 0x3f,
+            }
+        ];
+    } else {
+        nodesToBrowse = [
+            {
+                nodeId: node.nodeId,
+                referenceTypeId: "Organizes",
+                includeSubtypes: true,
+                browseDirection: BrowseDirection.Forward,
+                resultMask: 0x3f,
+            },
+            {
+                nodeId: node.nodeId,
+                referenceTypeId: "Aggregates",
+                includeSubtypes: true,
+                browseDirection: BrowseDirection.Forward,
+                resultMask: 0x3f,
+            },
+            {
+                nodeId: node.nodeId,
+                referenceTypeId: "HasSubtype",
+                includeSubtypes: true,
+                browseDirection: BrowseDirection.Forward,
+                resultMask: 0x3f,
+            },
+        ];
+    }
 
     try {
       const results = await browseAll(this.session, nodesToBrowse);
 
-      // organized
-      let result = results[0];
+      const seenNodes: Set<string> = new Set();
+      for (const result of results) {
+        if (result.references) {
+          for (const ref of result.references) {
+            const nodeIdStr = ref.nodeId.toString();
+            if (seenNodes.has(nodeIdStr)) continue;
+            seenNodes.add(nodeIdStr);
 
-      if (result.references) {
-        for (let i = 0; i < result.references.length; i++) {
-          const ref = result.references[i];
-
-          children.push({
-            arrow: referenceToSymbol(ref) + symbol(ref)[0],
-            displayName: ref.displayName.text || ref.browseName.toString(),
-            nodeId: ref.nodeId,
-            nodeClass: ref.nodeClass as number,
-          });
+            children.push({
+              arrow: referenceToSymbol(ref) + symbol(ref)[0],
+              displayName: ref.displayName.text || ref.browseName.toString(),
+              nodeId: ref.nodeId,
+              nodeClass: ref.nodeClass as number,
+              typeDefinition: ref.typeDefinition,
+            });
+          }
         }
       }
-      // Aggregates
-      result = results[1];
-      if (result.references) {
-        for (let i = 0; i < result.references.length; i++) {
-          const ref = result.references[i];
-          children.push({
-            arrow: referenceToSymbol(ref) + symbol(ref)[0],
-            displayName: ref.displayName.text || ref.browseName.toString(),
-            nodeId: ref.nodeId,
-            nodeClass: ref.nodeClass as number,
-          });
+
+      // Resolve type names
+      const typesToRead: { nodeId: NodeId; index: number }[] = [];
+      for (let i = 0; i < children.length; i++) {
+        const child = children[i] as any;
+        if (child.typeDefinition && !child.typeDefinition.isEmpty()) {
+          const typeNodeId = NodeId.resolveNodeId(child.typeDefinition);
+          const cacheKey = typeNodeId.toString();
+          if (this.typeNameCache.has(cacheKey)) {
+            child.typeDefinitionName = this.typeNameCache.get(cacheKey);
+          } else {
+            typesToRead.push({ nodeId: typeNodeId, index: i });
+          }
         }
       }
-      // HasSubType
-      result = results[2];
-      if (result.references) {
-        for (let i = 0; i < result.references.length; i++) {
-          const ref = result.references[i];
-          children.push({
-            arrow: referenceToSymbol(ref) + symbol(ref)[0],
-            displayName: ref.displayName.text || ref.browseName.toString(),
-            nodeId: ref.nodeId,
-            nodeClass: ref.nodeClass as number,
-          });
+
+      if (typesToRead.length > 0) {
+        // Read browse names of types in batch
+        const nodesToRead = typesToRead.map((t) => ({
+          nodeId: t.nodeId,
+          attributeId: AttributeIds.BrowseName,
+        }));
+        const dataValues = await this.session!.read(nodesToRead);
+        for (let j = 0; j < dataValues.length; j++) {
+          const dv = dataValues[j];
+          const typeNodeId = typesToRead[j].nodeId;
+          const childIndex = typesToRead[j].index;
+          let typeName = "";
+          if (dv.statusCode === StatusCodes.Good && dv.value.value) {
+            typeName = dv.value.value.name || dv.value.value.toString();
+            this.typeNameCache.set(typeNodeId.toString(), typeName);
+          }
+          (children[childIndex] as any).typeDefinitionName = typeName;
         }
       }
 
@@ -613,7 +1126,7 @@ export class Model extends EventEmitter {
     }
   }
 }
-function invert<T>(o: Record<string, T>) {
+function invert<T extends { toString(): string }>(o: Record<string, T>) {
   const r: Record<string, string> = {};
   for (const [k, v] of Object.entries(o)) {
     r[v.toString()] = k;
@@ -623,36 +1136,50 @@ function invert<T>(o: Record<string, T>) {
 const attributeIdToString = invert(AttributeIds);
 const DataTypeIdsToString = invert(DataTypeIds);
 
-function dataValueToString(dataValue: DataValue) {
+function dataValueValueToString(dataValue: DataValue, resolvedEnumString?: string | null) {
+  let s = "";
   if (!dataValue.value || dataValue.value.value === null) {
-    return "<???> : " + dataValue.statusCode.toString();
+    s = "<???>";
+  } else {
+    const value = dataValue.value.value;
+    switch (dataValue.value.arrayType) {
+      case VariantArrayType.Scalar:
+        if (resolvedEnumString) {
+          s = resolvedEnumString + " (" + value + ")";
+        } else {
+          s = dataValue.value.toString();
+        }
+        break;
+      case VariantArrayType.Array:
+        s = dataValue.value.toString();
+        break;
+      default:
+        s = "";
+        break;
+    }
   }
-  switch (dataValue.value.arrayType) {
-    case VariantArrayType.Scalar:
-      return dataValue.toString();
-    case VariantArrayType.Array:
-      return dataValue.toString();
-    default:
-      return "";
-  }
+  return s;
 }
 
-function toString1(attribute: AttributeIds, dataValue: DataValue | null) {
+function toString1(attribute: AttributeIds, dataValue: DataValue | null, dataTypeNodeId?: NodeId | null, resolvedEnumString?: string | null) {
   if (!dataValue || !dataValue.value || !dataValue.value.hasOwnProperty("value")) {
     return "<null>";
   }
+  const value = (dataValue.value as any).value;
   switch (attribute) {
-    case AttributeIds.DataType:
-      return DataTypeIdsToString[dataValue.value.value.value] + " (" + dataValue.value.value.toString() + ")";
+    case AttributeIds.DataType: {
+      const name = (value instanceof NodeId && value.namespace === 0) ? DataTypeIdsToString[value.value.toString()] : undefined;
+      return (name || "undefined") + " (" + value.toString() + ")";
+    }
     case AttributeIds.NodeClass:
-      return NodeClass[dataValue.value.value] + " (" + dataValue.value.value + ")";
+      return NodeClass[value] + " (" + value + ")";
     case AttributeIds.IsAbstract:
     case AttributeIds.Historizing:
     case AttributeIds.EventNotifier:
-      return dataValue.value.value ? "true" : "false";
+      return value ? "true" : "false";
     case AttributeIds.WriteMask:
     case AttributeIds.UserWriteMask:
-      return " (" + dataValue.value.value + ")";
+      return " (" + value + ")";
     case AttributeIds.NodeId:
     case AttributeIds.BrowseName:
     case AttributeIds.DisplayName:
@@ -662,17 +1189,18 @@ function toString1(attribute: AttributeIds, dataValue: DataValue | null) {
     case AttributeIds.Executable:
     case AttributeIds.UserExecutable:
     case AttributeIds.MinimumSamplingInterval:
-      if (!dataValue.value.value) {
+      if (!value) {
         return "null";
       }
-      return dataValue.value.value.toString();
+      return value.toString();
     case AttributeIds.UserAccessLevel:
     case AttributeIds.AccessLevel:
-      if (!dataValue.value.value) {
+      if (!value) {
         return "null";
       }
-      return accessLevelFlagToString(dataValue.value.value) + " (" + dataValue.value.value + ")";
+      return accessLevelFlagToString(value) + " (" + value + ")";
     default:
-      return dataValueToString(dataValue);
+      return dataValueValueToString(dataValue, resolvedEnumString);
   }
 }
+

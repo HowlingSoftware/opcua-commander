@@ -1,8 +1,14 @@
 {
   "name": "opcua-commander",
-  "version": "0.40.0",
+  "version": "1.2.5",
+  "type": "module",
   "description": "OPCUA CLI client",
-  "main": "bin/bundle.js",
+  "main": "bin/bundle.cjs",
+  "files": [
+    "bin/opcua-commander.js",
+    "bin/bundle.cjs",
+    "bin/usr"
+  ],
   "keywords": [
     "opcua",
     "iot",
@@ -13,9 +19,13 @@
   ],
   "scripts": {
     "build": "tsc -b && npm run bundle",
-    "bundle": "npx -y esbuild --bundle --outfile=bin/bundle.js --external:blessed  --external:chalk --external:wrap-ansi --minify-syntax --sourcemap --platform=node lib/index.ts",
-    "release": "npm run build && npm run bundle && npx release-it",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "bundle": "node scratch/patch-blessed.cjs && tsup && node scratch/post-bundle.cjs",
+    "test-server": "node test-bed/server.cjs",
+    "release": "npm run build && npm run bundle && npx release-it --npm.publish=false",
+    "release:patch": "npm run build && npm run bundle && npx release-it patch --ci --npm.publish=false",
+    "release:minor": "npm run build && npm run bundle && npx release-it minor --ci --npm.publish=false",
+    "release:major": "npm run build && npm run bundle && npx release-it major --ci --npm.publish=false",
+    "test": "vitest run",
     "ncu": "npx npm-check-updates -u -x chalk,yargs,env-paths,update-notifier,camel-case,cli-truncate",
     "start": "node bin/opcua-commander",
     "demo:secure": "node bin/opcua-commander -e opc.tcp://opcuademo.sterfive.com:26543 -s=SignAndEncrypt -P=Aes128_Sha256_RsaOaep -u=user1 -p=password1",
@@ -27,33 +37,42 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/node-opcua/opcua-commander.git"
+    "url": "git+https://github.com/node-opcua/opcua-commander.git"
+  },
+  "publishConfig": {
+    "provenance": true
   },
   "bin": {
-    "opcua-commander": "bin/opcua-commander"
+    "opcua-commander": "bin/opcua-commander.js"
   },
   "engines": {
-    "node": ">= 8.0"
+    "node": ">= 20.0"
   },
   "bugs": {
     "url": "https://github.com/node-opcua/opcua-commander/issues"
   },
   "dependencies": {
-    "node-opcua-certificate-manager": "^2.134.0",
-    "node-opcua-client": "^2.138.1",
-    "node-opcua-pki": "^4.16.0",
     "blessed": "^0.1.81",
-    "cli-truncate": "2.1.0",
+    "chalk": "^5.6.2",
     "check-node-version": "4.2.1",
-    "chalk": "4.1.2",
-    "wordwrap": "^1.0.0",
-    "yargs": "17.5.1"
+    "cli-truncate": "2.1.0",
+    "commander": "^15.0.0",
+    "node-opcua-certificate-manager": "^2.174.0",
+    "node-opcua-client": "^2.174.0",
+    "node-opcua-crypto": "^5.3.6",
+    "node-opcua-pki": "^6.18.0",
+    "proper-lockfile": "^4.1.2",
+    "wordwrap": "^1.0.0"
   },
   "devDependencies": {
-    "@types/blessed": "^0.1.25",
+    "@types/blessed": "^0.1.27",
     "@types/wordwrap": "^1.0.3",
-    "typescript": "^5.6.3",
-    "es-abstract": "^1.23.5",
-    "source-map-support": "^0.5.21"
+    "@vercel/ncc": "^0.44.1",
+    "es-abstract": "^1.24.2",
+    "node-opcua": "^2.174.0",
+    "source-map-support": "^0.5.21",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
   }
 }

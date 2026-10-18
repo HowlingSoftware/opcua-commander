@@ -16,4 +16,4 @@ COPY . .
 RUN npm run build
 
 VOLUME [ "/root/.config/opcua-commander-nodejs/pki" ]
-ENTRYPOINT [ "./bin/opcua-commander" ]
+ENTRYPOINT [ "./bin/opcua-commander.js" ]

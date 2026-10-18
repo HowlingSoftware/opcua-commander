@@ -1,0 +1,104 @@
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "[0-9]*"
+  workflow_dispatch:
+    inputs:
+      dist-tag:
+        description: "dist-tag"
+        required: true
+        default: "latest"
+        type: choice
+        options:
+          - latest
+          - next
+          - rc
+          - beta
+          - alpha
+
+permissions:
+  id-token: write # Required for OIDC token generation
+  contents: read # Required for actions/checkout
+
+jobs:
+  publish:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Set up Git user
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor}}@users.noreply.github.com"
+
+      - name: "Verify NPM registry connectivity"
+        run: npm ping
+
+      - name: "Stash build artifacts before publish"
+        run: git stash
+
+      - name: Publish to NPM
+        run: |
+          DIST_TAG="${{ github.event.inputs.dist-tag || 'latest' }}"
+          npm publish --tag "$DIST_TAG"
+        env:
+          NPM_CONFIG_PROVENANCE: true
+
+  publish-snap:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build and Bundle
+        run: |
+          npm run build
+          npm run bundle
+
+      - name: Sync Snapcraft Version with package.json
+        run: |
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          sed -i "s/^version: .*/version: \"$VERSION\"/" snap/snapcraft.yaml
+
+      - name: Build Snap Package
+        uses: snapcore/action-build@v1
+        id: build
+
+      - name: Publish to Snap Store
+        uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: stable
+
+
+
