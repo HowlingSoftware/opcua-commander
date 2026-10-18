@@ -10,7 +10,7 @@ RUN npm config set registry http://registry.npmjs.org/
 RUN npm install -g typescript 
 
 COPY package*.json ./
-RUN npm ci --mit=dev --unsafe-perm=true --allow-root 
+RUN npm ci
 
 COPY . .
 RUN npm run build
