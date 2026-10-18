@@ -11,3 +11,6 @@ dist/
 bin/bundle.*
 credentials*
 *.tgz
+*.tsbuildinfo
+bin/usr/
+bin/.bin/

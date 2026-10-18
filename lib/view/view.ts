@@ -2,13 +2,13 @@ import blessed from "blessed";
 import { format, callbackify } from "util";
 import chalk from "chalk";
 
-import { TreeItem } from "../widget/tree_item";
+import { TreeItem } from "../widget/tree_item.js";
 import { ClientAlarmList, NodeId, resolveNodeId, sameNodeId, VariantArrayType } from "node-opcua-client";
 
-import { Tree } from "../widget/widget_tree";
-import { Model, NodeChild } from "../model/model";
-import { updateAlarmBox } from "./alarm_box";
-import { w } from "../utils/utils";
+import { Tree } from "../widget/widget_tree.js";
+import { Model, NodeChild } from "../model/model.js";
+import { updateAlarmBox } from "./alarm_box.js";
+import { w } from "../utils/utils.js";
 
 const w2 = "40%";
 
@@ -40,7 +40,6 @@ const style = {
   },
 };
 
-let old_console_log: any;
 
 export function makeItems(arr: any[], width: number): string[] {
   return arr.map((a) => {
@@ -54,17 +53,29 @@ export class View {
   private monitoredItemsList: any;
   private $headers: string[] = [];
 
-  public screen: blessed.Widgets.Screen;
-  public area1: blessed.Widgets.BoxElement;
-  public area2: blessed.Widgets.BoxElement;
-  public menuBar: blessed.Widgets.ListbarElement;
+  public screen!: blessed.Widgets.Screen;
+  public area1!: blessed.Widgets.BoxElement;
+  public area2!: blessed.Widgets.BoxElement;
+  public menuBar!: blessed.Widgets.ListbarElement;
   public alarmBox?: blessed.Widgets.ListTableElement;
-  public attributeList: blessed.Widgets.ListElement;
+  public attributeList!: blessed.Widgets.ListElement;
   public attributeListNodeId?: NodeId;
-  public logWindow: blessed.Widgets.ListElement;
-  public tree: Tree;
-  public writeForm: blessed.Widgets.BoxElement;
-  public valuesToWriteElement: blessed.Widgets.TextboxElement;
+  public logWindow!: blessed.Widgets.ListElement;
+  public tree!: Tree;
+  public writeForm!: blessed.Widgets.BoxElement;
+  public valuesToWriteElement!: blessed.Widgets.TextboxElement;
+  public filterForm!: blessed.Widgets.BoxElement;
+  public filterInputElement!: blessed.Widgets.TextboxElement;
+  public referenceList!: blessed.Widgets.ListElement;
+  public referenceListHelp!: blessed.Widgets.TextElement;
+  public treeHelp!: blessed.Widgets.TextElement;
+  public monitoredItemsHelp!: blessed.Widgets.TextElement;
+  public logWindowHelp!: blessed.Widgets.TextElement;
+
+  private _history: NodeId[][] = [];
+  private _historyIndex = -1;
+  private _isPushingToHistory = false;
+  private _referenceFilter: "both" | "forward" | "backward" = "both";
 
   public model: Model;
 
@@ -97,11 +108,54 @@ export class View {
     this.screen.append(this.area2);
 
     this.attributeList = this.install_attributeList();
+    this.referenceList = this.install_referenceList();
     this.install_monitoredItemsWindow();
     this.install_writeFormWindow();
+    this.tree = this.install_address_space_explorer();
+    this.install_filterFormWindow();
     this.logWindow = this.install_logWindow();
     this.menuBar = this.install_mainMenu();
-    this.tree = this.install_address_space_explorer();
+    
+    // Global focus cycling
+    this.screen.key(["tab"], () => {
+      if (this.screen.focused === this.tree) {
+        if (this.attributeList.visible) {
+            this.attributeList.focus();
+        } else {
+            this.referenceList.focus();
+        }
+      } else if (this.screen.focused === this.attributeList || this.screen.focused === this.referenceList) {
+        this.monitoredItemsList.focus();
+      } else if (this.screen.focused === this.monitoredItemsList) {
+        this.logWindow.focus();
+      } else {
+        this.tree.focus();
+      }
+    });
+    this.screen.key(["S-tab"], () => {
+      if (this.screen.focused === this.tree) {
+        this.logWindow.focus();
+      } else if (this.screen.focused === this.logWindow) {
+        this.monitoredItemsList.focus();
+      } else if (this.screen.focused === this.monitoredItemsList) {
+        if (this.attributeList.visible) {
+            this.attributeList.focus();
+        } else {
+            this.referenceList.focus();
+        }
+      } else {
+        this.tree.focus();
+      }
+    });
+
+    // Global Help Command
+    this.screen.key(["f1", "?"], () => {
+      if (this.screen.focused === this.filterInputElement) {
+        return;
+      }
+      this._showHelpDialog();
+    });
+
     // Render the screen.
     this.screen.render();
   }
@@ -249,6 +303,318 @@ export class View {
     this.area1.append(this.writeForm);
   }
 
+  private matchNode(node: any, query: string): boolean {
+    if (!node) return false;
+    const q = query.toLowerCase();
+    const displayName = (node.displayName || "").toLowerCase();
+    const name = (node.name || "").toLowerCase();
+    const nodeIdStr = (node.nodeId ? node.nodeId.toString() : "").toLowerCase();
+    const typeDef = (node.typeDefinitionName || "").toLowerCase();
+
+    return displayName.includes(q) || name.includes(q) || nodeIdStr.includes(q) || typeDef.includes(q);
+  }
+
+  private findMatch(tree: Tree, query: string, startIndex: number, direction: "down" | "up" = "down"): number {
+    const items = (tree as any).items || [];
+    if (items.length === 0 || !query) return -1;
+
+    const total = items.length;
+    let step = direction === "down" ? 1 : -1;
+
+    for (let i = 0; i < total; i++) {
+      const idx = (startIndex + i * step + total) % total;
+      const item = items[idx];
+      if (item && item.node && this.matchNode(item.node, query)) {
+        return idx;
+      }
+    }
+    return -1;
+  }
+
+  private updateTreeHelp(searchActive: boolean = false): void {
+    if (this.treeHelp) {
+      if (searchActive) {
+        this.treeHelp.setContent(" [f] or [/]  {yellow-fg}Cycle:{/yellow-fg} [F3]/[S-F3]  {yellow-fg}Clear:{/yellow-fg} [Ctrl-U]  {yellow-fg}Node ID:{/yellow-fg} ns=/nsu=");
+      } else {
+        this.treeHelp.setContent(" [↑/↓] Nav  [→/+] Exp  [←/-] Coll  [f] Find  [m] Mon");
+      }
+    }
+  }
+
+  private _showHelpDialog(): void {
+    const previousFocus = this.screen.focused;
+
+    const helpBox = blessed.box({
+      parent: this.screen,
+      top: "center",
+      left: "center",
+      width: 70,
+      height: 22,
+      border: "line",
+      label: " {bold}{cyan-fg}OPC UA Commander Help{/cyan-fg}{/bold} ",
+      tags: true,
+      style: {
+        border: {
+          fg: "cyan",
+        },
+        bg: "black",
+        fg: "white",
+      },
+      keys: true,
+      vi: true,
+      scrollable: true,
+      scrollbar: {
+        ch: " ",
+        track: {
+          bg: "cyan",
+        },
+        style: {
+          inverse: true,
+        },
+      },
+    });
+
+    const helpText = `
+ {bold}{yellow-fg}Global Shortcuts{/yellow-fg}{/bold}
+   {bold}Tab{/bold}       : Cycle Focus Forward
+   {bold}Shift-Tab{/bold} : Cycle Focus Backward
+   {bold}w{/bold}         : Write Value
+   {bold}k{/bold}         : Call Method
+   {bold}s{/bold}         : Show Statistics
+   {bold}a{/bold}         : Toggle Alarms
+   {bold}r{/bold}         : Toggle Reference / Attribute view
+   {bold}[{/bold}         : History Back
+   {bold}]{/bold}         : History Forward
+   {bold}h{/bold}         : Toggle Subtype Mode
+   {bold}q / x{/bold}     : Exit Application
+
+ {bold}{yellow-fg}Tree Explorer{/yellow-fg}{/bold}
+   {bold}↑ / ↓{/bold}     : Navigate Nodes
+   {bold}→ / +{/bold}     : Expand Node
+   {bold}← / -{/bold}     : Collapse Node
+   {bold}f / /{/bold}     : Find / Filter Nodes
+   {bold}m{/bold}         : Monitor Node
+
+   {bold}{yellow-fg}Search Bar (when active){/yellow-fg}{/bold}
+     {bold}F3{/bold}        : Next Search Match
+     {bold}Shift-F3{/bold}  : Previous Search Match
+     {bold}Ctrl-U{/bold}    : Clear Search Input
+     {bold}Enter{/bold}     : Locate Node ID (ns=/nsu=) or Close Search
+     {bold}Escape{/bold}    : Cancel Search
+
+ {bold}{yellow-fg}Monitored Items{/yellow-fg}{/bold}
+   {bold}u{/bold}         : Unmonitor Selected Item
+
+ {bold}{yellow-fg}Info Log Window{/yellow-fg}{/bold}
+   {bold}c{/bold}         : Clear Log
+
+ {bold}{yellow-fg}References Window{/yellow-fg}{/bold}
+   {bold}f{/bold}         : Show Forward References
+   {bold}b{/bold}         : Show Backward References
+   {bold}a{/bold}         : Show All References
+
+ {yellow-fg}Press [Escape], [Enter], or [Space] to close this help window.{/yellow-fg}
+`;
+
+    const contentBox = blessed.box({
+      parent: helpBox,
+      top: 0,
+      left: 1,
+      width: "100%-4",
+      height: "100%-2",
+      content: helpText,
+      tags: true,
+      scrollable: true,
+      keys: true,
+      vi: true,
+    });
+
+    const closeHelp = () => {
+      helpBox.destroy();
+      if (previousFocus) {
+        previousFocus.focus();
+      }
+      this.screen.render();
+    };
+
+    helpBox.key(["escape", "enter", "space"], closeHelp);
+    contentBox.key(["escape", "enter", "space"], closeHelp);
+
+    this.screen.append(helpBox);
+    helpBox.focus();
+    this.screen.render();
+  }
+
+  private activateSearch(): void {
+    this.filterForm.show();
+    this.area1.append(this.filterForm);
+    this.updateTreeHelp(true);
+    this.filterInputElement.focus();
+    this.screen.render();
+  }
+
+  private performSearch(query: string, startIndex: number, direction: "down" | "up"): void {
+    const matchIndex = this.findMatch(this.tree, query, startIndex, direction);
+    if (matchIndex >= 0) {
+      this.filterInputElement.style.fg = "white";
+      this.tree.select(matchIndex);
+      this.tree.scrollTo(matchIndex);
+    } else {
+      this.filterInputElement.style.fg = "red";
+    }
+    this.screen.render();
+  }
+
+  install_filterFormWindow() {
+    this.filterForm = blessed.box({
+      parent: this.area1,
+      top: 1,
+      left: 1,
+      width: "40%-2",
+      height: 1,
+      style: {
+        bg: "blue",
+      },
+      hidden: true,
+    });
+
+    const searchLabel = blessed.text({
+      parent: this.filterForm,
+      top: 0,
+      left: 1,
+      width: 8,
+      height: 1,
+      content: "Search:",
+      style: {
+        bg: "blue",
+        fg: "yellow",
+        bold: true,
+      },
+    });
+
+    this.filterInputElement = blessed.textbox({
+      parent: this.filterForm,
+      name: "filterPattern",
+      top: 0,
+      left: 9,
+      width: "100%-10",
+      height: 1,
+      inputOnFocus: true,
+      style: {
+        bg: "blue",
+        fg: "white",
+      },
+    });
+
+    this.filterInputElement.on("keypress", (ch: any, key: any) => {
+      process.nextTick(() => {
+        const query = this.filterInputElement.getValue().trim();
+        const isNodeIdPattern = /^(ns|nsi|nsu|s|i)=/i.test(query);
+        if (query) {
+          if (isNodeIdPattern) {
+            this.filterInputElement.style.fg = "yellow";
+            this.screen.render();
+          } else {
+            this.filterInputElement.style.fg = "white";
+            this.performSearch(query, this.tree.getSelectedIndex(), "down");
+          }
+        } else {
+          this.filterInputElement.style.fg = "white";
+          this.screen.render();
+        }
+      });
+    });
+
+    this.filterInputElement.key(["escape"], () => {
+      this.tree.focus();
+    });
+
+    this.filterInputElement.key(["C-u"], () => {
+      this.filterInputElement.setValue("");
+      this.filterInputElement.style.fg = "white";
+      this.screen.render();
+    });
+
+    this.filterInputElement.key(["enter"], async () => {
+      const query = this.filterInputElement.getValue().trim();
+      const isNodeIdPattern = /^(ns|nsi|nsu|s|i)=/i.test(query);
+
+      if (isNodeIdPattern) {
+        this.filterInputElement.style.fg = "yellow";
+        this.screen.render();
+
+        try {
+          const resolvedNodeId = await this.model.parseNodeId(query);
+          
+          const exists = await this.model.nodeExists(resolvedNodeId);
+          if (!exists) {
+            throw new Error(`Node ID '${resolvedNodeId.toString()}' does not exist on the server.`);
+          }
+
+          const path = await this.model.findPathToRoot(resolvedNodeId);
+          const rootFolderId = resolveNodeId("RootFolder");
+          const reachedRoot = path.length > 0 && sameNodeId(path[0], rootFolderId);
+
+          if (!reachedRoot) {
+            this.filterInputElement.style.fg = "orange";
+            this.screen.render();
+            console.log(
+              chalk.yellow(
+                `[GoTo] Warning: Could not find path to root for node '${resolvedNodeId.toString()}'. The server may not support inverse hierarchical browse.`
+              )
+            );
+            return; // keep focus on search box in orange state so they see the warning
+          }
+
+          await this.tree.expandPath(path);
+          this.filterInputElement.style.fg = "white";
+        } catch (err: any) {
+          this.filterInputElement.style.fg = "red";
+          this.screen.render();
+          console.log(chalk.red(`[GoTo] Error: ${err.message || err}`));
+          return; // keep focus on search box in red state so they see the error
+        }
+      }
+
+      this.tree.focus();
+    });
+
+    this.filterInputElement.on("blur", () => {
+      this.filterForm.hide();
+      this.filterInputElement.style.fg = "white";
+      this.updateTreeHelp(false);
+      this.screen.render();
+    });
+
+    // Bind F3 globally on the screen to find next match
+    this.screen.key(["f3"], () => {
+      if (this.screen.focused !== this.tree && this.screen.focused !== this.filterInputElement) {
+        return;
+      }
+      const query = this.filterInputElement.getValue().trim();
+      if (query && !/^(ns|nsi|nsu|s|i)=/i.test(query)) {
+        this.performSearch(query, this.tree.getSelectedIndex() + 1, "down");
+      }
+    });
+
+    // Bind Shift-F3 globally on the screen to find previous match
+    this.screen.key(["S-f3"], () => {
+      if (this.screen.focused !== this.tree && this.screen.focused !== this.filterInputElement) {
+        return;
+      }
+      const query = this.filterInputElement.getValue().trim();
+      if (query && !/^(ns|nsi|nsu|s|i)=/i.test(query)) {
+        this.performSearch(query, this.tree.getSelectedIndex() - 1, "up");
+      }
+    });
+
+    // Bind keys on the tree directly to ensure search is activated
+    // even when the tree intercepts standard screen/listbar keys.
+    this.tree.key(["f", "/"], () => {
+      this.activateSearch();
+    });
+  }
+
   install_monitoredItemsWindow() {
     this.monitoredItemsList = blessed.listtable({
       parent: this.area1,
@@ -267,7 +633,34 @@ export class View {
     });
     this.area1.append(this.monitoredItemsList);
 
-    // binding .....
+    this.monitoredItemsHelp = blessed.text({
+      parent: this.area1,
+      top: "100%-1",
+      left: w2 + "+2",
+      width: "60%-3",
+      height: 1,
+      tags: true,
+      content: " {yellow-fg}Actions:{/yellow-fg} [u] Unmonitor",
+      style: {
+        bg: "black",
+        fg: "white",
+      },
+      hidden: true,
+    });
+    this.area1.append(this.monitoredItemsHelp);
+
+    this.monitoredItemsList.on("focus", () => {
+      this.monitoredItemsHelp.show();
+      this.screen.render();
+    });
+    this.monitoredItemsList.on("blur", () => {
+      this.monitoredItemsHelp.hide();
+      this.screen.render();
+    });
+
+    this.monitoredItemsList.key(["u"], () => {
+      this._onUnmonitoredSelectedItem();
+    });
 
     this.model.on("monitoredItemListUpdated", (monitoredItemsListData: any) => {
       if (monitoredItemsListData.length > 0) {
@@ -314,17 +707,38 @@ export class View {
       style: { ...style },
     });
 
-    old_console_log = console.log;
-
-    console.log = function (...args: [any]) {
-      const str = format.apply(null, args);
-      const lines = str.split("\n");
-      lines.forEach((str: string) => {
-        logWindow.addItem(str);
-      });
-      logWindow.select((logWindow as any).items.length - 1);
-    };
     this.area2.append(logWindow);
+
+    this.logWindowHelp = blessed.text({
+      parent: this.area2,
+      top: "100%-3",
+      left: 2,
+      width: "100%-4",
+      height: 1,
+      tags: true,
+      content: " {yellow-fg}Actions:{/yellow-fg} [c] Clear",
+      style: {
+        bg: "black",
+        fg: "white",
+      },
+      hidden: true,
+    });
+    this.area2.append(this.logWindowHelp);
+
+    logWindow.on("focus", () => {
+      this.logWindowHelp.show();
+      this.screen.render();
+    });
+    logWindow.on("blur", () => {
+      this.logWindowHelp.hide();
+      this.screen.render();
+    });
+
+    logWindow.key(["c"], () => {
+      logWindow.clearItems();
+      logWindow.screen.render();
+    });
+
     return logWindow;
   }
 
@@ -353,10 +767,9 @@ export class View {
     this.area2.append(menuBar);
 
     (menuBar as any).setItems({
-      Monitor: {
-        //xx prefix: "M",
-        keys: ["m"],
-        callback: () => this._onMonitoredSelectedItem(),
+      Help: {
+        keys: ["?", "f1"],
+        callback: () => this._showHelpDialog(),
       },
       Write: {
         keys: ["w"],
@@ -366,38 +779,41 @@ export class View {
         keys: ["q", "x"], //["C-c", "escape"],
         callback: () => this._onExit(),
       },
-      Tree: {
-        keys: ["t"],
-        callback: () => this.tree.focus(),
-      },
-      Attributes: {
-        keys: ["l"],
-        callback: () => this.attributeList.focus(),
-      },
-      Info: {
-        keys: ["i"],
-        callback: () => this.logWindow.focus(),
-      },
-      Clear: {
-        keys: ["c"],
-        callback: () => {
-          this.logWindow.clearItems();
-          this.logWindow.screen.render();
-        },
-      },
-      Unmonitor: {
-        keys: ["u"],
-        callback: () => this._onUnmonitoredSelectedItem(),
-      },
       Stat: {
         keys: ["s"],
         callback: () => this._onDumpStatistics(),
       },
       Alarm: {
         keys: ["a"],
-        callback: this._onToggleAlarmWindows.bind(this),
+        callback: () => {
+          if (this.screen.focused !== this.referenceList) {
+            this._onToggleAlarmWindows();
+          }
+        },
       },
-      //  "Menu": { keys: ["A-a", "x"], callback: () => this.menuBar.focus() }
+      Call: {
+        keys: ["k"],
+        callback: () => this._onCallMethodSelectedItem(),
+      },
+      Reference: {
+        keys: ["r"],
+        callback: () => this._toggleAttributeReference(),
+      },
+      Back: {
+        keys: ["["],
+        callback: () => this._historyBack(),
+      },
+      Forward: {
+        keys: ["]"],
+        callback: () => this._historyForward(),
+      },
+      Subtype: {
+        keys: ["h"],
+        callback: () => {
+          this.model.subtypeMode = !this.model.subtypeMode;
+          this.populateTree();
+        },
+      },
     });
     return menuBar;
   }
@@ -418,6 +834,7 @@ export class View {
       mouse: true,
       border: "line",
       style: { ...style },
+      showNamespace: this.model.showNamespace,
     });
 
     //allow control the table with the keyboard
@@ -442,6 +859,39 @@ export class View {
     });
 
     this.area1.append(this.tree);
+
+    this.treeHelp = blessed.text({
+      parent: this.area1,
+      top: "100%-1",
+      left: 1,
+      width: "40%-2",
+      height: 1,
+      tags: true,
+      content: "",
+      style: {
+        bg: "black",
+        fg: "white",
+      },
+      hidden: false,
+    });
+    this.area1.append(this.treeHelp);
+    this.updateTreeHelp(false);
+
+    this.tree.on("focus", () => {
+      this.treeHelp.show();
+      this.screen.render();
+    });
+    this.tree.on("blur", () => {
+      if (this.filterForm && !this.filterForm.hidden) {
+        return;
+      }
+      this.treeHelp.hide();
+      this.screen.render();
+    });
+
+    this.tree.key(["m"], () => {
+      this._onMonitoredSelectedItem();
+    });
 
     this.populateTree();
     this.tree.focus();
@@ -476,13 +926,23 @@ export class View {
   }
 
   private _onNodeChanged(nodeId: NodeId) {
-    if (sameNodeId(this.attributeListNodeId, nodeId)) {
+    if (this.attributeListNodeId && sameNodeId(this.attributeListNodeId, nodeId)) {
       // we need to refresh the attribute list
       this.fill_attributesRegion(nodeId);
     }
   }
 
-  private async fill_attributesRegion(nodeId: NodeId) {
+  private async fill_attributesRegion(nodeId: NodeId, path?: NodeId[]) {
+    if (!path) {
+      const treeItem = this.tree.getSelectedItem();
+      if (treeItem && treeItem.node && sameNodeId(treeItem.node.nodeId, nodeId)) {
+        path = this._getPathToRoot(treeItem.node);
+      } else {
+        path = [nodeId];
+      }
+    }
+    this._pushToHistory(path);
+    this.fill_referencesRegion(nodeId); // async but don't wait
     type ATT = [string, string];
     const attr: ATT[] = [];
 
@@ -509,6 +969,129 @@ export class View {
     this.attributeList.setItems(makeItems(attr, width) as any);
     this.attributeList.screen.render();
     this.attributeListNodeId = nodeId;
+  }
+
+  private install_referenceList(): blessed.Widgets.ListElement {
+    this.referenceList = blessed.list({
+      parent: this.area1,
+      label: " {bold}{cyan-fg}Reference List{/cyan-fg}{/bold} ",
+      top: 0,
+      tags: true,
+      left: w2 + "+1",
+      width: "60%-1",
+      height: "50%",
+      border: "line",
+      scrollbar: scrollbar,
+      style: { ...style },
+      align: "left",
+      keys: true,
+      hidden: true,
+    });
+    this.area1.append(this.referenceList);
+
+    this.referenceListHelp = blessed.text({
+      parent: this.area1,
+      top: "50%-1",
+      left: w2 + "+2",
+      width: "60%-3",
+      height: 1,
+      tags: true,
+      content: " {yellow-fg}Filter:{/yellow-fg} [f] Forward  [b] Backward  [a] All",
+      style: {
+        bg: "black",
+        fg: "white",
+      },
+      hidden: true,
+    });
+    this.area1.append(this.referenceListHelp);
+
+    this.referenceList.on("focus", () => {
+      this.referenceListHelp.show();
+      this.screen.render();
+    });
+    this.referenceList.on("blur", () => {
+      this.referenceListHelp.hide();
+      this.screen.render();
+    });
+
+    this.referenceList.on("select", (item: any, index: number) => {
+      const nodeIds = (this.referenceList as any)._nodeIds;
+      if (nodeIds && nodeIds[index]) {
+        this._jumpToNode(nodeIds[index]);
+      }
+    });
+
+    this.referenceList.key(["f"], () => {
+        this._referenceFilter = "forward";
+        const treeItem = this.tree.getSelectedItem();
+        if (treeItem && treeItem.node) {
+            this.fill_referencesRegion(treeItem.node.nodeId);
+        }
+    });
+    this.referenceList.key(["b"], () => {
+        this._referenceFilter = "backward";
+        const treeItem = this.tree.getSelectedItem();
+        if (treeItem && treeItem.node) {
+            this.fill_referencesRegion(treeItem.node.nodeId);
+        }
+    });
+    this.referenceList.key(["a"], () => {
+        this._referenceFilter = "both";
+        const treeItem = this.tree.getSelectedItem();
+        if (treeItem && treeItem.node) {
+            this.fill_referencesRegion(treeItem.node.nodeId);
+        }
+    });
+
+    return this.referenceList;
+  }
+
+  private async fill_referencesRegion(nodeId: NodeId) {
+    let references = await this.model.browseReferences(nodeId);
+    
+    // Filtering
+    if (this._referenceFilter === "forward") {
+        references = references.filter(r => r.isForward);
+    } else if (this._referenceFilter === "backward") {
+        references = references.filter(r => !r.isForward);
+    }
+
+    const blessedColors = [
+        "white", "cyan", "green", "yellow", "magenta", "blue", "red",
+        "light-cyan", "light-green", "light-yellow", "light-magenta", "light-blue", "light-red"
+    ];
+
+    const enrichedReferences = await Promise.all(references.map(async (ref) => {
+      const direc = ref.isForward ? "->" : "<-";
+      const refTypeNodeId = NodeId.resolveNodeId(ref.referenceTypeId);
+      const refTypeName = await this.model.getBrowseNameMaybe(refTypeNodeId);
+      const target = ref.browseName.toString();
+      return { ref, direc, refTypeName, target };
+    }));
+
+    enrichedReferences.sort((a, b) => {
+      const cmpDirec = a.direc.localeCompare(b.direc);
+      if (cmpDirec !== 0) return cmpDirec;
+      const cmpRefType = a.refTypeName.localeCompare(b.refTypeName);
+      if (cmpRefType !== 0) return cmpRefType;
+      return a.target.localeCompare(b.target);
+    });
+
+    (this.referenceList as any)._nodeIds = enrichedReferences.map((item) => NodeId.resolveNodeId(item.ref.nodeId));
+
+    const items = enrichedReferences.map((item) => {
+      const ref = item.ref;
+      const ns = ref.nodeId.namespace;
+      const color = blessedColors[ns % blessedColors.length];
+      const browseName = `{${color}-fg}${item.target}{/${color}-fg}`;
+      const nodeIdStr = chalk.grey(`(${ref.nodeId.toString()})`);
+      return ` ${item.direc} ${item.refTypeName} : ${browseName} ${nodeIdStr}`;
+    });
+    
+    const filterLabel = this._referenceFilter.toUpperCase();
+    this.referenceList.setLabel(` {bold}{cyan-fg}References [${filterLabel}]{/cyan-fg}{/bold} `);
+    this.referenceList.setItems(items as any);
+    this.screen.render();
   }
 
   private install_attributeList(): blessed.Widgets.ListElement {
@@ -577,7 +1160,7 @@ export class View {
     this.alarmBox.setData(data);
 
     this.model.installAlarmMonitoring();
-    this.model.on("alarmChanged", (list: ClientAlarmList) => updateAlarmBox(list, this.alarmBox, this.$headers));
+    this.model.on("alarmChanged", (list: ClientAlarmList) => updateAlarmBox(list, this.alarmBox!, this.$headers, this.model));
     this.alarmBox.focus();
   }
 
@@ -604,13 +1187,13 @@ export class View {
     this.screen.render();
   }
 
-  private _onMonitoredSelectedItem() {
+  private async _onMonitoredSelectedItem() {
     const treeItem = this.tree.getSelectedItem();
     if (treeItem.node.monitoredItem) {
       console.log(" Already monitoring ", treeItem.node.nodeId.toString());
       return;
     }
-    this.model.monitor_item(treeItem);
+    await this.model.monitor_item(treeItem);
   }
   private async _onWriteSelectedItem() {
     this.writeForm.show();
@@ -652,5 +1235,117 @@ export class View {
     const treeItem = this.tree.getSelectedItem();
     const browsePath = await this.model.extractBrowsePath(treeItem.node.nodeId);
     console.log(chalk.cyan("selected node browse path :", chalk.magenta(browsePath)));
+  }
+
+  public async run(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      this.screen.on("destroy", resolve);
+    });
+  }
+
+  private async _onCallMethodSelectedItem() {
+    const treeItem = this.tree.getSelectedItem();
+    if (!treeItem || !treeItem.node) return;
+    console.log(" Call Method on ", treeItem.node.nodeId.toString());
+    // TODO: Implement method call
+  }
+
+  private _getPathToRoot(node: any): NodeId[] {
+    const path: NodeId[] = [];
+    let current = node;
+    while (current) {
+      if (current.nodeId) {
+        path.unshift(current.nodeId);
+      }
+      current = current.parent;
+    }
+    return path;
+  }
+
+  private _pushToHistory(path: NodeId[]) {
+    if (this._isPushingToHistory) return;
+    if (this._historyIndex >= 0) {
+      const currentPath = this._history[this._historyIndex];
+      if (currentPath && currentPath.length === path.length && currentPath.every((id, idx) => sameNodeId(id, path[idx]))) {
+        return;
+      }
+
+      // Check if we are navigating up to the parent of the current node
+      if (currentPath && path.length === currentPath.length - 1 && path.every((id, idx) => sameNodeId(id, currentPath[idx]))) {
+        // If the previous history entry is already the parent, just go back to it
+        if (this._historyIndex > 0) {
+          const prevPath = this._history[this._historyIndex - 1];
+          if (prevPath && prevPath.length === path.length && prevPath.every((id, idx) => sameNodeId(id, path[idx]))) {
+            this._historyIndex--;
+            return;
+          }
+        }
+        // Otherwise, insert the parent path right before the current child path
+        this._history.splice(this._historyIndex, 0, path);
+        // index remains pointing to the newly inserted parent, and child is forward!
+        return;
+      }
+    }
+
+    // Truncate future history if we were in the middle of standard navigation
+    this._history = this._history.slice(0, this._historyIndex + 1);
+    this._history.push(path);
+    this._historyIndex = this._history.length - 1;
+    if (this._history.length > 50) {
+      this._history.shift();
+      this._historyIndex--;
+    }
+  }
+
+  private async _historyBack() {
+    if (this._historyIndex > 0) {
+      this._historyIndex--;
+      await this._jumpToNode(this._history[this._historyIndex], true);
+    }
+  }
+
+  private async _historyForward() {
+    if (this._historyIndex < this._history.length - 1) {
+      this._historyIndex++;
+      await this._jumpToNode(this._history[this._historyIndex], true);
+    }
+  }
+
+  private async _jumpToNode(nodeIdOrPath: NodeId | NodeId[], fromHistory = false) {
+    this._isPushingToHistory = true;
+    try {
+      let path: NodeId[];
+      let nodeId: NodeId;
+      if (Array.isArray(nodeIdOrPath)) {
+        path = nodeIdOrPath;
+        nodeId = path[path.length - 1];
+      } else {
+        nodeId = nodeIdOrPath;
+        path = await this.model.findPathToRoot(nodeId);
+      }
+      await this.tree.expandPath(path);
+      if (!fromHistory) {
+        this._pushToHistory(path);
+      }
+      await this.fill_attributesRegion(nodeId, path);
+      await this.fill_referencesRegion(nodeId);
+    } finally {
+      this._isPushingToHistory = false;
+    }
+  }
+
+  private _toggleAttributeReference() {
+    if (this.attributeList.visible) {
+      this.attributeList.hide();
+      this.referenceList.show();
+      this.referenceListHelp.show();
+      this.referenceList.focus();
+    } else {
+      this.referenceList.hide();
+      this.referenceListHelp.hide();
+      this.attributeList.show();
+      this.attributeList.focus();
+    }
+    this.screen.render();
   }
 }
